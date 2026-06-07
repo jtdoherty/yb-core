@@ -145,6 +145,33 @@ but **cannot be validated without the whitepaper math + the Hypothesis stateful 
 weaponized to mint shares in `withdraw_admin_fees` (`LT.vy:882-914` asserts `v.admin >= 0`,
 good) or to dilute the staker.
 
+**PoC update (`poc/lt_accounting_model.py`):** a faithful Python port of this accounting was
+fuzzed with a full-unwind solvency oracle after every op. **At the production
+`min_admin_fee = 10%`, no conservation/solvency violation was found** across 1500 seeds × 2
+scenarios — the "mint shares from rounding" theft does not appear to exist at production
+parameters. See M-4 for the one real (LP-safety) degeneracy it did surface.
+
+### M-4 — Admin-fee buffer never disgorges on losses → can strand LP withdrawals (PoC-confirmed)
+**Contract:** `LT.vy:321-333` (`_calculate_values`), `LT.vy:565-567` (`withdraw` frac),
+`LT.vy:512-523` (deposit first-branch), `LT.vy:899-906` (`withdraw_admin_fees`).
+
+When `staked ≥ MIN_STAKED_FOR_FEES` and `value_change < 0`, the admin buffer is left
+unchanged (`dv_use = value_change*1e18` ⇒ `prev.admin += 0`); on gains it accrues. So the
+buffer ratchets up and is **never clawed back on losses**. Under a narrow adversarial path —
+sustained drawdown, most of supply staked, and **repeated partial unstaking** (which perturbs
+the `ideal_staked` loss-clawback) — the buffer can exceed the pool's actual value. Then
+`new_total = max(prev_value*1e18 + dv_use, 0)` **clamps `total` to 0**, so `withdraw`'s
+`frac = 1e18*total/(total+admin)*… → 0` (**LPs withdraw nothing**, burning shares if they try),
+`withdraw_admin_fees` divides by `total == 0` (reverts), and a deposit in this window hits the
+first-deposit reset branch. The stranded value self-heals only on price recovery.
+
+**PoC-measured brick frequency (6000 adversarial seeds each):** 10% fee → 0.02%; 20% → 0.03%;
+30% → 0.07%; 50% → 0.50%. **Severity Low→Medium:** not attacker-profit theft (no third party
+gains; value is stranded, not stolen), reachable at the production 10% fee only on a narrow
+path, probability rises with the governance-set fee. **Fix:** cap `set_min_admin_fee` well
+below 1e18; make the buffer symmetric (reduce on losses) or guard the `total == 0`
+withdraw/deposit paths so LP value can't be stranded.
+
 ### L-1 — Oracle availability coupling: when the AMM enters the "untradable" region, normal pricing/withdraw revert
 **Contracts:** `AMM.get_x0` (`AMM.vy:142-157`, `D` can underflow → revert),
 `AMM.value_oracle`/`get_state`, consumed by `LT.pricePerShare`, `LT.withdraw`,
